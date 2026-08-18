@@ -57,39 +57,40 @@ def extract_files(share_url):
         
         # Aguardar conteúdo JavaScript carregar
         import time
-        time.sleep(3)
+        time.sleep(5)  # Aumentado para garantir que JS carregou
         
-        # Extrair dados do JavaScript
-        files = driver.execute_script("""
-            // Tentar múltiplas fontes de dados
-            const sources = [
-                window.__INITIAL_STATE__,
-                window.__pageData,
-                window.initData,
-                window.pageData,
-                window.yunData,
-                window.locals
-            ];
-            
-            for (let data of sources) {
-                if (!data) continue;
-                
-                // Buscar em diferentes estruturas
-                if (data.list && Array.isArray(data.list)) {
-                    return data.list;
-                }
-                if (data.file_list && Array.isArray(data.file_list)) {
-                    return data.file_list;
-                }
-                if (data.fileList && Array.isArray(data.fileList)) {
-                    return data.fileList;
-                }
-            }
-            return null;
+        # Extrair TUDO que encontrar nas variáveis JavaScript
+        all_data = driver.execute_script("""
+            // Retornar TODAS as variáveis possíveis para debug
+            return {
+                __INITIAL_STATE__: window.__INITIAL_STATE__ || null,
+                __pageData: window.__pageData || null,
+                initData: window.initData || null,
+                pageData: window.pageData || null,
+                yunData: window.yunData || null,
+                locals: window.locals || null,
+                templateData: window.templateData || null,
+                shareData: window.shareData || null
+            };
         """)
         
+        # Buscar lista de arquivos em múltiplas estruturas
+        files = None
+        for key, data in all_data.items():
+            if not data:
+                continue
+            
+            # Buscar diferentes estruturas de lista
+            for list_key in ['list', 'file_list', 'fileList', 'file', 'files']:
+                if list_key in data and isinstance(data[list_key], list) and len(data[list_key]) > 0:
+                    files = data[list_key]
+                    break
+            
+            if files:
+                break
+        
+        # Se não encontrou, tentar extrair do HTML
         if not files:
-            # Tentar extrair do DOM
             files = driver.execute_script("""
                 const items = document.querySelectorAll('.file-item, [class*="file"], .list-item');
                 const result = [];
@@ -99,14 +100,21 @@ def extract_files(share_url):
                     if (name && name.textContent.trim()) {
                         result.push({
                             server_filename: name.textContent.trim(),
-                            size: size ? size.textContent.trim() : 'Unknown'
+                            size: size ? size.textContent.trim() : 'Unknown',
+                            isFromDOM: true
                         });
                     }
                 });
                 return result.length > 0 ? result : null;
             """)
         
-        return files
+        # Retornar arquivos E dados brutos para debug
+        return {
+            'files': files,
+            'raw_data': all_data,
+            'page_url': driver.current_url,
+            'page_title': driver.title
+        }
         
     finally:
         if driver:
@@ -135,38 +143,52 @@ def api():
         }), 400
     
     try:
-        files = extract_files(url)
+        result = extract_files(url)
         
-        if not files:
+        if not result or not result.get('files'):
             return jsonify({
                 'success': False,
-                'error': 'No files found'
+                'error': 'No files found',
+                'debug': result  # Retornar dados para debug
             }), 404
+        
+        files = result['files']
         
         # Formatar resposta
         results = []
         for file in files:
             if isinstance(file, dict):
+                # Pegar dados completos se disponível
                 results.append({
-                    'file_name': file.get('server_filename', 'Unknown'),
-                    'size': file.get('size', 'Unknown'),
-                    'size_bytes': file.get('size', 0) if isinstance(file.get('size'), int) else 0,
-                    'download_url': file.get('dlink', ''),
+                    'file_name': file.get('server_filename') or file.get('filename') or file.get('name') or 'Unknown',
+                    'size': file.get('size_format') or file.get('size') or 'Unknown',
+                    'size_bytes': int(file.get('size', 0)) if isinstance(file.get('size'), int) else 0,
+                    'download_url': file.get('dlink') or file.get('download_url') or file.get('url') or '',
                     'path': file.get('path', ''),
-                    'fs_id': file.get('fs_id', '')
+                    'fs_id': str(file.get('fs_id', '')),
+                    'thumbs': file.get('thumbs', {}),
+                    'category': file.get('category', 0),
+                    'isdir': file.get('isdir', 0)
                 })
         
         return jsonify({
             'success': True,
             'method': 'selenium',
             'files': results,
-            'total': len(results)
+            'total': len(results),
+            'debug': {
+                'page_url': result.get('page_url'),
+                'page_title': result.get('page_title'),
+                'raw_keys': list(result.get('raw_data', {}).keys())
+            }
         })
         
     except Exception as e:
+        import traceback
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': str(e),
+            'traceback': traceback.format_exc()
         }), 500
 
 if __name__ == '__main__':
