@@ -61,8 +61,8 @@ def extract_files(share_url):
         
         # Extrair TUDO que encontrar nas variáveis JavaScript
         all_data = driver.execute_script("""
-            // Retornar TODAS as variáveis possíveis para debug
-            return {
+            // Retornar TODAS as variáveis possíveis
+            const data = {
                 __INITIAL_STATE__: window.__INITIAL_STATE__ || null,
                 __pageData: window.__pageData || null,
                 initData: window.initData || null,
@@ -72,19 +72,44 @@ def extract_files(share_url):
                 templateData: window.templateData || null,
                 shareData: window.shareData || null
             };
+            
+            // Também tentar pegar do HTML (pode estar em script tags)
+            const scripts = document.querySelectorAll('script');
+            for (let script of scripts) {
+                const text = script.textContent;
+                
+                // Procurar por padrões comuns
+                if (text.includes('window.yunData') || text.includes('locals.mset')) {
+                    data.scriptContent = text.substring(0, 5000); // Primeiros 5000 chars
+                    break;
+                }
+            }
+            
+            return data;
         """)
         
         # Buscar lista de arquivos em múltiplas estruturas
         files = None
+        source_found = None
+        
         for key, data in all_data.items():
-            if not data:
+            if key == 'scriptContent':
+                continue
+            if not data or not isinstance(data, dict):
                 continue
             
             # Buscar diferentes estruturas de lista
-            for list_key in ['list', 'file_list', 'fileList', 'file', 'files']:
-                if list_key in data and isinstance(data[list_key], list) and len(data[list_key]) > 0:
-                    files = data[list_key]
-                    break
+            possible_keys = ['list', 'file_list', 'fileList', 'file', 'files', 'items']
+            for list_key in possible_keys:
+                if list_key in data:
+                    potential_files = data[list_key]
+                    if isinstance(potential_files, list) and len(potential_files) > 0:
+                        # Verificar se tem dados reais (não só DOM)
+                        first_item = potential_files[0]
+                        if isinstance(first_item, dict) and ('fs_id' in first_item or 'dlink' in first_item or 'size' in first_item):
+                            files = potential_files
+                            source_found = f"{key}.{list_key}"
+                            break
             
             if files:
                 break
@@ -112,6 +137,7 @@ def extract_files(share_url):
         return {
             'files': files,
             'raw_data': all_data,
+            'source_found': source_found,
             'page_url': driver.current_url,
             'page_title': driver.title
         }
@@ -125,12 +151,77 @@ def index():
     return jsonify({
         'service': 'Terabox Selenium Service',
         'status': 'operational',
-        'endpoint': '/api?url=TERABOX_URL'
+        'endpoints': {
+            '/': 'API information',
+            '/health': 'Health check',
+            '/api': 'Extract files from Terabox URL',
+            '/debug': 'Debug endpoint - shows raw page data'
+        },
+        'usage': {
+            'api': '/api?url=TERABOX_URL',
+            'debug': '/debug?url=TERABOX_URL'
+        }
     })
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'ok'})
+
+@app.route('/debug')
+def debug():
+    """Endpoint para debug - retorna dados JavaScript brutos"""
+    url = request.args.get('url')
+    
+    if not url:
+        return jsonify({
+            'success': False,
+            'error': 'Missing URL parameter'
+        }), 400
+    
+    driver = None
+    try:
+        driver = setup_driver()
+        driver.get(url)
+        
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        
+        import time
+        time.sleep(5)
+        
+        # Extrair TUDO em formato JSON
+        all_data = driver.execute_script("""
+            return {
+                __INITIAL_STATE__: window.__INITIAL_STATE__ || null,
+                __pageData: window.__pageData || null,
+                initData: window.initData || null,
+                pageData: window.pageData || null,
+                yunData: window.yunData || null,
+                locals: window.locals || null,
+                templateData: window.templateData || null,
+                shareData: window.shareData || null
+            };
+        """)
+        
+        return jsonify({
+            'success': True,
+            'url': url,
+            'current_url': driver.current_url,
+            'title': driver.title,
+            'data': all_data
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+    finally:
+        if driver:
+            driver.quit()
 
 @app.route('/api')
 def api():
@@ -179,7 +270,8 @@ def api():
             'debug': {
                 'page_url': result.get('page_url'),
                 'page_title': result.get('page_title'),
-                'raw_keys': list(result.get('raw_data', {}).keys())
+                'raw_keys': list(result.get('raw_data', {}).keys()),
+                'source_found': result.get('source_found')
             }
         })
         
