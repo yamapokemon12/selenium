@@ -48,18 +48,29 @@ def extract_files(share_url):
     driver = None
     try:
         driver = setup_driver()
+        
+        # Habilitar captura de network logs
+        driver.execute_cdp_cmd('Network.enable', {})
+        
         driver.get(share_url)
         
-        # Aguardar página carregar (aumentado timeout)
+        # Aguardar página carregar
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
         
-        # Aguardar conteúdo JavaScript carregar
+        # Aguardar MAIS TEMPO para AJAX carregar os dados
         import time
-        time.sleep(5)  # Aumentado para garantir que JS carregou
+        time.sleep(10)  # 10 segundos para garantir AJAX completo
         
-        # Extrair TUDO que encontrar nas variáveis JavaScript
+        # Tentar clicar em elementos para forçar carregamento
+        try:
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(2)
+        except:
+            pass
+        
+        # Extrair TUDO incluindo requisições de rede
         all_data = driver.execute_script("""
             // Retornar TODAS as variáveis possíveis
             const data = {
@@ -73,14 +84,40 @@ def extract_files(share_url):
                 shareData: window.shareData || null
             };
             
-            // Também tentar pegar do HTML (pode estar em script tags)
+            // NOVO: Tentar extrair dados de requisições XHR armazenadas
+            if (window.performance && window.performance.getEntries) {
+                const resources = window.performance.getEntries();
+                data.networkRequests = resources
+                    .filter(r => r.initiatorType === 'xmlhttprequest' || r.initiatorType === 'fetch')
+                    .map(r => r.name);
+            }
+            
+            // NOVO: Procurar em TODOS os objetos globais
+            const globalKeys = Object.keys(window);
+            const potentialData = {};
+            for (let key of globalKeys) {
+                if (key.toLowerCase().includes('file') || 
+                    key.toLowerCase().includes('share') || 
+                    key.toLowerCase().includes('list') ||
+                    key.toLowerCase().includes('data')) {
+                    try {
+                        const value = window[key];
+                        if (value && typeof value === 'object') {
+                            potentialData[key] = value;
+                        }
+                    } catch(e) {}
+                }
+            }
+            data.potentialData = potentialData;
+            
+            // Tentar pegar do HTML (pode estar em script tags)
             const scripts = document.querySelectorAll('script');
             for (let script of scripts) {
                 const text = script.textContent;
                 
-                // Procurar por padrões comuns
-                if (text.includes('window.yunData') || text.includes('locals.mset')) {
-                    data.scriptContent = text.substring(0, 5000); // Primeiros 5000 chars
+                // Procurar por padrões comuns de dados
+                if (text.includes('"list":[') || text.includes('"server_filename"') || text.includes('"dlink"')) {
+                    data.scriptContent = text;
                     break;
                 }
             }
@@ -92,27 +129,71 @@ def extract_files(share_url):
         files = None
         source_found = None
         
-        for key, data in all_data.items():
-            if key == 'scriptContent':
-                continue
-            if not data or not isinstance(data, dict):
-                continue
-            
-            # Buscar diferentes estruturas de lista
-            possible_keys = ['list', 'file_list', 'fileList', 'file', 'files', 'items']
-            for list_key in possible_keys:
-                if list_key in data:
-                    potential_files = data[list_key]
-                    if isinstance(potential_files, list) and len(potential_files) > 0:
-                        # Verificar se tem dados reais (não só DOM)
-                        first_item = potential_files[0]
-                        if isinstance(first_item, dict) and ('fs_id' in first_item or 'dlink' in first_item or 'size' in first_item):
-                            files = potential_files
-                            source_found = f"{key}.{list_key}"
-                            break
-            
-            if files:
-                break
+        # NOVO: Se encontrou scriptContent, tentar parsear JSON dele
+        if 'scriptContent' in all_data and all_data['scriptContent']:
+            try:
+                import re
+                import json
+                script = all_data['scriptContent']
+                
+                # Procurar por padrão {"list":[...]}
+                match = re.search(r'\{[^{}]*"list"\s*:\s*\[(.*?)\]\s*[,}]', script, re.DOTALL)
+                if match:
+                    try:
+                        # Tentar extrair o objeto completo
+                        json_match = re.search(r'\{[^{}]*"list"\s*:\s*\[.*?\].*?\}', script, re.DOTALL)
+                        if json_match:
+                            data_obj = json.loads(json_match.group(0))
+                            if 'list' in data_obj:
+                                files = data_obj['list']
+                                source_found = 'scriptContent.parsed'
+                    except:
+                        pass
+            except:
+                pass
+        
+        # Buscar em potentialData se ainda não encontrou
+        if not files and 'potentialData' in all_data:
+            for key, data in all_data['potentialData'].items():
+                if not isinstance(data, dict):
+                    continue
+                
+                for list_key in ['list', 'file_list', 'fileList', 'file', 'files', 'items']:
+                    if list_key in data:
+                        potential_files = data[list_key]
+                        if isinstance(potential_files, list) and len(potential_files) > 0:
+                            first_item = potential_files[0]
+                            if isinstance(first_item, dict) and ('fs_id' in first_item or 'dlink' in first_item or 'server_filename' in first_item):
+                                files = potential_files
+                                source_found = f"potentialData.{key}.{list_key}"
+                                break
+                
+                if files:
+                    break
+        
+        # Buscar nas variáveis conhecidas se ainda não encontrou
+        if not files:
+            for key, data in all_data.items():
+                if key in ['scriptContent', 'networkRequests', 'potentialData']:
+                    continue
+                if not data or not isinstance(data, dict):
+                    continue
+                
+                # Buscar diferentes estruturas de lista
+                possible_keys = ['list', 'file_list', 'fileList', 'file', 'files', 'items']
+                for list_key in possible_keys:
+                    if list_key in data:
+                        potential_files = data[list_key]
+                        if isinstance(potential_files, list) and len(potential_files) > 0:
+                            # Verificar se tem dados reais (não só DOM)
+                            first_item = potential_files[0]
+                            if isinstance(first_item, dict) and ('fs_id' in first_item or 'dlink' in first_item or 'size' in first_item):
+                                files = potential_files
+                                source_found = f"{key}.{list_key}"
+                                break
+                
+                if files:
+                    break
         
         # Se não encontrou, tentar extrair do HTML
         if not files:
@@ -181,6 +262,10 @@ def debug():
     driver = None
     try:
         driver = setup_driver()
+        
+        # Habilitar network logs
+        driver.execute_cdp_cmd('Network.enable', {})
+        
         driver.get(url)
         
         WebDriverWait(driver, 20).until(
@@ -188,7 +273,14 @@ def debug():
         )
         
         import time
-        time.sleep(5)
+        time.sleep(10)  # Aguardar AJAX
+        
+        # Scroll para forçar carregamento
+        try:
+            driver.execute_script("window.scrollTo(0, 500);")
+            time.sleep(2)
+        except:
+            pass
         
         # Extrair TUDO em formato JSON
         all_data = driver.execute_script("""
@@ -204,12 +296,33 @@ def debug():
             };
         """)
         
+        # Pegar HTML completo
+        html_content = driver.page_source
+        
+        # Procurar por dados JSON no HTML
+        import re
+        json_patterns = [
+            r'"list"\s*:\s*\[(.*?)\]',
+            r'"server_filename"\s*:\s*"([^"]+)"',
+            r'"dlink"\s*:\s*"([^"]+)"',
+            r'"fs_id"\s*:\s*(\d+)',
+        ]
+        
+        found_patterns = {}
+        for pattern in json_patterns:
+            matches = re.findall(pattern, html_content)
+            if matches:
+                found_patterns[pattern] = len(matches)
+        
         return jsonify({
             'success': True,
             'url': url,
             'current_url': driver.current_url,
             'title': driver.title,
-            'data': all_data
+            'data': all_data,
+            'html_size': len(html_content),
+            'patterns_found': found_patterns,
+            'html_snippet': html_content[:2000]  # Primeiros 2000 chars do HTML
         })
         
     except Exception as e:
